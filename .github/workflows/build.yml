@@ -1,48 +1,112 @@
 # .github/workflows/build.yml  (in a repo e.g. water1309/caddy-transip)
 # Builds the custom Caddy + TransIP image and pushes to GHCR.
-# Same shape as your other custom-image pipelines (SavaPage / Paperless / speakr-ntfy-relay):
-# REGISTRY / IMAGE_NAME as env-level vars so this lifts cleanly to the Forgejo
-# registry when you do Phase 8 (git.vanwaardenberg.com).
-name: build-caddy-transip
-
+# Same shape as your other custom-image pipelines:poll the upstream release, build+tag with the
+# matching version when it's new, let homelab Renovate bump the compose pin off
+# the new GHCR tag. The Dockerfile's `ARG CADDY_VERSION` default is only for local
+# builds — this workflow overrides it with the detected version via --build-arg.
+name: Build and Push caddy-transip
+ 
 on:
-  push:
-    branches: [main]
-    paths: [Dockerfile, .github/workflows/build.yml]   # rebuild on config changes, not just Caddy bumps
-  workflow_dispatch: {}                                 # manual: bump ARG CADDY_VERSION -> run
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/caddy-transip
-
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if the upstream tag is unchanged (after editing the Dockerfile)'
+        type: boolean
+        default: false
+ 
+permissions:
+  contents: write        # to commit .last_built_tag
+  packages: write        # to push to GHCR
+ 
 jobs:
-  build:
+  build-and-push:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
-      - uses: actions/checkout@v4
-
-      # Pull the Caddy version out of the Dockerfile so the image tag matches the pin.
-      - name: Resolve Caddy version
-        id: ver
-        run: echo "caddy=$(grep -oP 'ARG CADDY_VERSION=\K.*' Dockerfile)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
+ 
+      - name: Check for a new upstream Caddy release
+        id: check
+        run: |
+          set -euo pipefail
+          # Caddy release tags are v-prefixed (v2.11.4); Caddy's DOCKER tags are not (2.11.4).
+          RTAG=$(curl -sfL https://api.github.com/repos/caddyserver/caddy/releases/latest | jq -r .tag_name)
+          if [ -z "$RTAG" ] || [ "$RTAG" = "null" ]; then
+            echo "::error::could not read the latest Caddy release tag from the GitHub API"; exit 1
+          fi
+          VER="${RTAG#v}"                                   # 2.11.4  -> build-arg + image tag
+          PREV=$(cat .last_built_tag 2>/dev/null || echo none)
+          echo "version=$VER"       >> "$GITHUB_OUTPUT"
+          echo "previous=$PREV"     >> "$GITHUB_OUTPUT"
+          if [ "$VER" = "$PREV" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "up to date: $VER already built"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "building: $PREV -> $VER"
+          fi
+ 
+      # A Caddy GitHub release can land before the Docker images are published.
+      # We need BOTH caddy:<ver>-builder (build stage) and caddy:<ver> (runtime).
+      # Guessing wrong is a 404 at build time — verify, else bail and retry tomorrow.
+      - name: Verify upstream Caddy images exist
+        if: steps.check.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          VER='${{ steps.check.outputs.version }}'
+          for img in "caddy:${VER}-builder" "caddy:${VER}"; do
+            if ! docker manifest inspect "$img" >/dev/null 2>&1; then
+              echo "::error::release v$VER exists but $img is not published yet."
+              echo "::error::Not building — a tag must never claim a version it does not contain."
+              echo "::error::Tomorrow's scheduled run will retry."
+              exit 1
+            fi
+          done
+          echo "upstream images present: caddy:${VER}-builder + caddy:${VER}"
+ 
+      - name: Build and push
+        id: build
+        if: steps.check.outputs.build == 'true'
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          build-args: |
+            CADDY_VERSION=${{ steps.check.outputs.version }}
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.caddy }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            ghcr.io/water1309/caddy-transip:latest
+            ghcr.io/water1309/caddy-transip:${{ steps.check.outputs.version }}
+ 
+      - name: Summary
+        if: steps.check.outputs.build == 'true'
+        run: |
+          {
+            echo "### Pushed \`${{ steps.check.outputs.version }}\`"
+            echo ""
+            echo "built FROM \`caddy:${{ steps.check.outputs.version }}-builder\` + caddy-dns/transip"
+            echo ""
+            echo '```yaml'
+            echo "    image: ghcr.io/water1309/caddy-transip:${{ steps.check.outputs.version }}@${{ steps.build.outputs.digest }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+ 
+      - name: Save built tag
+        if: steps.check.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          echo "${{ steps.check.outputs.version }}" > .last_built_tag
+          git config user.name  github-actions
+          git config user.email github-actions@github.com
+          git add .last_built_tag
+          git diff --cached --quiet && { echo "no change to .last_built_tag"; exit 0; }
+          git commit -m "Built caddy ${{ steps.check.outputs.version }}"
+          git push
