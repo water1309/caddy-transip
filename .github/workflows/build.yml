@@ -1,0 +1,48 @@
+# .github/workflows/build.yml  (in a repo e.g. water1309/caddy-transip)
+# Builds the custom Caddy + TransIP image and pushes to GHCR.
+# Same shape as your other custom-image pipelines (SavaPage / Paperless / speakr-ntfy-relay):
+# REGISTRY / IMAGE_NAME as env-level vars so this lifts cleanly to the Forgejo
+# registry when you do Phase 8 (git.vanwaardenberg.com).
+name: build-caddy-transip
+
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, .github/workflows/build.yml]   # rebuild on config changes, not just Caddy bumps
+  workflow_dispatch: {}                                 # manual: bump ARG CADDY_VERSION -> run
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/caddy-transip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pull the Caddy version out of the Dockerfile so the image tag matches the pin.
+      - name: Resolve Caddy version
+        id: ver
+        run: echo "caddy=$(grep -oP 'ARG CADDY_VERSION=\K.*' Dockerfile)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.caddy }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
