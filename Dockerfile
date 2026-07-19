@@ -13,8 +13,14 @@
 ARG CADDY_VERSION=2.11.4
 
 FROM caddy:${CADDY_VERSION}-builder AS builder
+# NOTE: no @version on the module. caddy-dns/transip is tagged v2.0.3 but its
+# module path has no /v2 suffix, which violates Go semantic-import-versioning --
+# `...transip@v2.0.3` fails with "major version must be compatible: should be
+# v0 or v1, not v2". The bare path resolves the default-branch pseudo-version
+# (identical code), which is how caddy-dns modules are meant to be referenced.
+# Reproducibility comes from the GHCR image digest pin in compose, not this tag.
 RUN xcaddy build \
-    --with github.com/caddy-dns/transip@v2.0.3
+    --with github.com/caddy-dns/transip
 
 FROM caddy:${CADDY_VERSION}
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
