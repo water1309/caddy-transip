@@ -19,8 +19,18 @@ FROM caddy:${CADDY_VERSION}-builder AS builder
 # v0 or v1, not v2". The bare path resolves the default-branch pseudo-version
 # (identical code), which is how caddy-dns modules are meant to be referenced.
 # Reproducibility comes from the GHCR image digest pin in compose, not this tag.
+#
+# --replace golang.org/x/crypto: CVE-2026-56854 (CRITICAL). Neither the pinned
+# Caddy release (2.11.4) nor even Caddy's unreleased master branch (as of
+# 2026-09-08) requires x/crypto >= v0.55.0 (2.11.4 wants v0.52.0, master wants
+# v0.54.0) -- so Go's MVS never picks the patched version on its own, and
+# caddy-dns/transip doesn't pull it in either. --replace writes a go.mod
+# replace directive (unlike --with, it does NOT add a blank import), forcing
+# the fixed version regardless of what upstream requires. Drop this once a
+# released Caddy version requires x/crypto >= v0.55.0 on its own.
 RUN xcaddy build \
-    --with github.com/caddy-dns/transip
+    --with github.com/caddy-dns/transip \
+    --replace golang.org/x/crypto=golang.org/x/crypto@v0.55.0
 
 FROM caddy:${CADDY_VERSION}
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
